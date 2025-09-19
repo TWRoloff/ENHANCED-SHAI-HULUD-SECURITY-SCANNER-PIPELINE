@@ -320,12 +320,25 @@ stages:
           # Initialize found packages file
           touch security-reports/filesystem/found-packages.txt
           
-          # Scan common Node.js locations only
+          # Enhanced filesystem scanning for scoped packages
           for path in $COMMON_NODE_PATHS; do
             if [[ -d "$path" ]]; then
               echo "Scanning: $path"
-              find "$path" -type d -maxdepth ${{ parameters.scanDepth }} -name "*" 2>/dev/null | while read -r dir; do
+              
+              # Find regular packages (non-scoped)
+              find "$path" -mindepth 1 -maxdepth 1 -type d ! -name "@*" 2>/dev/null | while read -r dir; do
                 basename "$dir"
+              done >> security-reports/filesystem/found-packages.txt
+              
+              # Find scoped packages (@scope/package)
+              find "$path" -mindepth 1 -maxdepth 1 -type d -name "@*" 2>/dev/null | while read -r scope_dir; do
+                scope_name=$(basename "$scope_dir")
+                if [[ -d "$scope_dir" ]]; then
+                  find "$scope_dir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r pkg_dir; do
+                    pkg_name=$(basename "$pkg_dir")
+                    echo "${scope_name}/${pkg_name}"
+                  done
+                fi
               done >> security-reports/filesystem/found-packages.txt
             fi
           done
@@ -405,13 +418,74 @@ stages:
           while read -r file; do
             if [[ -f "$file" && -n "$file" ]]; then
               echo "Scanning: $file"
+              
+              # Add debugging to show threat list
+              echo "🔍 Available threats in final-threats.txt:"
+              head -10 security-reports/final-threats.txt || echo "No threats file found"
+              
+              # Extract package name and version from threat list
               while read -r threat; do
-                if [[ -n "$threat" ]]; then
-                  if grep -F "$threat" "$file" >/dev/null 2>&1; then
-                    echo "❌ THREAT DETECTED in $file: $threat"
-                    echo "$file: $threat" >> security-reports/dependencies/detected-threats.txt
-                    threats_found=1
+                # Skip empty lines and lines that don't match expected format
+                # Accept both scoped (@scope/package@version) and regular (package@version) packages
+                if [[ -n "$threat" && "$threat" == *"@"* ]]; then
+                  # Use bash parameter expansion for proper parsing
+                  pkg_name="${threat%@*}"       # Everything before the last @
+                  pkg_version="${threat##*@}"   # Everything after the last @
+                  
+                  # Skip if package name or version is empty
+                  if [[ -z "$pkg_name" || -z "$pkg_version" ]]; then
+                    echo "⚠️ Skipping malformed threat: '$threat'"
+                    continue
                   fi
+                  
+                  # Check if it's a package.json file for enhanced parsing
+                  if [[ "$file" == *"package.json" ]]; then
+                    echo "🔍 Parsing JSON dependencies in $file for $pkg_name@$pkg_version"
+                    
+                    # Method 1: Direct string search for exact threat
+                    if grep -F "\"$pkg_name\"" "$file" >/dev/null 2>&1 && grep -F "\"$pkg_version\"" "$file" >/dev/null 2>&1; then
+                      echo "❌ THREAT DETECTED in $file: $pkg_name@$pkg_version (direct search)"
+                      echo "$file: $pkg_name@$pkg_version" >> security-reports/dependencies/detected-threats.txt
+                      threats_found=1
+                    # Method 2: JSON parsing for package name and version using jq if available
+                    elif command -v jq >/dev/null 2>&1; then
+                      # Check in dependencies section
+                      declared_version=$(jq -r --arg pkg "$pkg_name" '.dependencies[$pkg] // empty' "$file" 2>/dev/null)
+                      if [[ -n "$declared_version" && ( "$declared_version" == "$pkg_version" || "$declared_version" == "^$pkg_version" || "$declared_version" == "~$pkg_version" ) ]]; then
+                        echo "❌ THREAT DETECTED in $file: $pkg_name@$declared_version (dependencies)"
+                        echo "$file: $pkg_name@$declared_version" >> security-reports/dependencies/detected-threats.txt
+                        threats_found=1
+                      fi
+                      
+                      # Check in devDependencies section
+                      declared_version=$(jq -r --arg pkg "$pkg_name" '.devDependencies[$pkg] // empty' "$file" 2>/dev/null)
+                      if [[ -n "$declared_version" && ( "$declared_version" == "$pkg_version" || "$declared_version" == "^$pkg_version" || "$declared_version" == "~$pkg_version" ) ]]; then
+                        echo "❌ THREAT DETECTED in $file: $pkg_name@$declared_version (devDependencies)"
+                        echo "$file: $pkg_name@$declared_version" >> security-reports/dependencies/detected-threats.txt
+                        threats_found=1
+                      fi
+                    else
+                      # Fallback: Check if package name and version appear in dependencies or devDependencies context
+                      if grep -A 10 -B 2 "\"dependencies\"" "$file" | grep -F "\"$pkg_name\"" | grep -F "\"$pkg_version\"" >/dev/null 2>&1; then
+                        echo "❌ THREAT DETECTED in $file: $pkg_name@$pkg_version (fallback dependencies)"
+                        echo "$file: $pkg_name@$pkg_version" >> security-reports/dependencies/detected-threats.txt
+                        threats_found=1
+                      elif grep -A 10 -B 2 "\"devDependencies\"" "$file" | grep -F "\"$pkg_name\"" | grep -F "\"$pkg_version\"" >/dev/null 2>&1; then
+                        echo "❌ THREAT DETECTED in $file: $pkg_name@$pkg_version (fallback devDependencies)"
+                        echo "$file: $pkg_name@$pkg_version" >> security-reports/dependencies/detected-threats.txt
+                        threats_found=1
+                      fi
+                    fi
+                  else
+                    # For non-JSON files (yarn.lock, pnpm-lock.yaml), use direct string search
+                    if grep -F "$threat" "$file" >/dev/null 2>&1; then
+                      echo "❌ THREAT DETECTED in $file: $threat"
+                      echo "$file: $threat" >> security-reports/dependencies/detected-threats.txt
+                      threats_found=1
+                    fi
+                  fi
+                else
+                  echo "⚠️ Skipping invalid threat line: '$threat'"
                 fi
               done < security-reports/final-threats.txt
             fi
