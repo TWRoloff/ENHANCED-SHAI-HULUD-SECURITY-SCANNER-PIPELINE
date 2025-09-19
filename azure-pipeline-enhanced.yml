@@ -1,0 +1,654 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🛡️ ENHANCED SHAI-HULUD SECURITY SCANNER PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════════
+# Advanced multi-stage security scanning for npm package compromise detection
+# with threat intelligence, SBOM generation, and comprehensive reporting.
+
+trigger:
+  - main
+  - develop
+  - release/*
+
+# ─── PIPELINE PARAMETERS ─────────────────────────────────────────────────────
+parameters:
+  - name: agentPool
+    displayName: 'Agent Pool'
+    type: string
+    default: 'clh-pool'
+  - name: threatFeedUrl
+    displayName: 'Threat Intelligence Feed URL'
+    type: string
+    default: 'https://api.github.com/advisories'
+  - name: scanDepth
+    displayName: 'Filesystem Scan Depth'
+    type: number
+    default: 3
+  - name: timeoutMinutes
+    displayName: 'Scan Timeout (minutes)'
+    type: number
+    default: 15
+  - name: enableParallelScans
+    displayName: 'Enable Parallel Scanning'
+    type: boolean
+    default: true
+  - name: generateSBOM
+    displayName: 'Generate Software Bill of Materials'
+    type: boolean
+    default: true
+
+# ─── PIPELINE VARIABLES ───────────────────────────────────────────────────────
+variables:
+  - name: pipelineVersion
+    value: '2.0.0'
+  - name: scanTimestamp
+    value: $[format('{0:yyyy}-{0:MM}-{0:dd}-{0:HH}-{0:mm}-{0:ss}', pipeline.startTime)]
+  - name: artifactName
+    value: 'security-scan-results-$(scanTimestamp)'
+  - name: compromisedPackagesFile
+    value: 'compromised.txt'
+  - name: sbomFile
+    value: 'sbom-$(scanTimestamp).json'
+
+stages:
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔧 STAGE 0: PIPELINE INITIALIZATION
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: PipelineInit
+  displayName: "🔧 Pipeline Initialization & Validation"
+  jobs:
+  - job: Initialize
+    displayName: "Initialize security scanning environment"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 5
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "🚀 Shai-Hulud Security Scanner v$(pipelineVersion)"
+          echo "📅 Scan Timestamp: $(scanTimestamp)"
+          echo "🎯 Target Repository: $(Build.Repository.Name)"
+          echo "🔗 Build ID: $(Build.BuildId)"
+          
+          # Create working directories
+          mkdir -p security-reports logs temp-data
+          
+          # Validate compromised packages file
+          if [[ ! -f "$(compromisedPackagesFile)" ]]; then
+            echo "⚠️ Creating default compromised packages file..."
+            echo "@ctrl/tinycolor@99.99.99" > $(compromisedPackagesFile)
+          fi
+          
+          # Validate file format
+          if ! grep -E '^[^@]+@[0-9]+\.[0-9]+\.[0-9]+' $(compromisedPackagesFile); then
+            echo "❌ Invalid compromised packages file format"
+            exit 1
+          fi
+          
+          echo "✅ Pipeline initialization completed"
+        displayName: "Initialize environment and validate inputs"
+
+      - script: |
+          echo "🔍 Environment Information:"
+          echo "OS: $(uname -a)"
+          echo "Node.js: $(node --version || echo 'Not installed')"
+          echo "npm: $(npm --version || echo 'Not installed')"
+          echo "jq: $(jq --version || echo 'Not installed')"
+          echo "curl: $(curl --version | head -1 || echo 'Not installed')"
+        displayName: "Environment audit"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📡 STAGE 1: THREAT INTELLIGENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: ThreatIntelligence
+  displayName: "📡 Threat Intelligence Gathering"
+  dependsOn: PipelineInit
+  jobs:
+  - job: GatherThreatData
+    displayName: "Fetch latest threat intelligence"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 10
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "📡 Fetching threat intelligence from multiple sources..."
+          
+          # Create required directories
+          mkdir -p security-reports temp-data
+          
+          # Merge static and dynamic threat data
+          if [[ -f "$(compromisedPackagesFile)" ]]; then
+            cp "$(compromisedPackagesFile)" security-reports/comprehensive-threats.txt
+            echo "✅ Using existing compromised packages file: $(compromisedPackagesFile)"
+          else
+            echo "⚠️ Compromised packages file not found, creating default..."
+            echo "@ctrl/tinycolor@99.99.99" > security-reports/comprehensive-threats.txt
+          fi
+          
+          # Fetch from GitHub Security Advisories (if accessible)
+          echo "🔍 Attempting to fetch from: ${{ parameters.threatFeedUrl }}"
+          if curl -s --connect-timeout 10 "${{ parameters.threatFeedUrl }}" > temp-data/github-advisories.json 2>/dev/null; then
+            echo "✅ Successfully fetched GitHub advisories"
+            echo "📄 API Response size: $(wc -c < temp-data/github-advisories.json) bytes"
+            echo "📄 First 200 characters of response:"
+            head -c 200 temp-data/github-advisories.json || echo "No content"
+            
+            # Count threats before GitHub parsing
+            before_count=$(wc -l < security-reports/comprehensive-threats.txt)
+            echo "📊 Threats before GitHub data: $before_count"
+            
+            # Extract npm package advisories (with corrected GitHub API format)
+            if command -v jq >/dev/null 2>&1; then
+              echo "🔍 Attempting to parse GitHub advisories with jq..."
+              echo "🔍 Checking for vulnerabilities array structure..."
+              
+              # GitHub Security Advisory API actual format analysis
+              jq -r '.[] | select(.vulnerabilities[]?.package.ecosystem == "npm") | .vulnerabilities[] | select(.package.ecosystem == "npm") | "\(.package.name)@\(.vulnerable_version_range // "*")"' temp-data/github-advisories.json >> security-reports/comprehensive-threats.txt 2>/dev/null || {
+                echo "⚠️ First parsing attempt failed, trying alternative format..."
+                # Try alternative structure if vulnerabilities is direct
+                jq -r '.[] | select(has("vulnerabilities")) | .vulnerabilities[] | select(.package.ecosystem == "npm") | "\(.package.name)@\(.vulnerable_version_range // "*")"' temp-data/github-advisories.json >> security-reports/comprehensive-threats.txt 2>/dev/null || {
+                  echo "⚠️ Second attempt failed, checking if there's an ecosystem field directly..."
+                  # Try if ecosystem is at root level
+                  jq -r '.[] | select(.ecosystem == "npm") | "\(.package // .name)@\(.vulnerable_version_range // "*")"' temp-data/github-advisories.json >> security-reports/comprehensive-threats.txt 2>/dev/null || {
+                    echo "⚠️ All parsing attempts failed, analyzing actual structure..."
+                    echo "🔍 Full sample record structure:"
+                    jq '.[0]' temp-data/github-advisories.json 2>/dev/null || echo "Cannot parse JSON"
+                  }
+                }
+              }
+              
+              # Count threats after GitHub parsing
+              after_count=$(wc -l < security-reports/comprehensive-threats.txt)
+              github_added=$((after_count - before_count))
+              echo "📊 Threats after GitHub data: $after_count (added: $github_added)"
+              
+              if [[ $github_added -eq 0 ]]; then
+                echo "⚠️ No threats added from GitHub API - detailed format analysis..."
+                echo "🔍 Checking for npm-related fields in first record:"
+                jq -r '.[0] | keys[] | select(test("npm|package|ecosystem|vuln"; "i"))' temp-data/github-advisories.json 2>/dev/null || echo "No npm-related fields found"
+                echo "🔍 Looking for nested objects:"
+                jq -r '.[0] | to_entries[] | select(.value | type == "object" or type == "array") | .key' temp-data/github-advisories.json 2>/dev/null || echo "No nested objects found"
+              fi
+            else
+              echo "⚠️ jq not available, skipping GitHub advisories parsing"
+            fi
+          else
+            echo "❌ Could not fetch external threat intelligence from GitHub API"
+            echo "🔍 Testing connectivity to GitHub..."
+            curl -s --connect-timeout 5 "https://api.github.com" > /dev/null && echo "✅ GitHub API reachable" || echo "❌ GitHub API unreachable"
+            
+            # Try alternative npm advisory database
+            echo "🔄 Trying alternative npm audit API..."
+            if curl -s --connect-timeout 10 "https://registry.npmjs.org/-/npm/v1/security/advisories" > temp-data/npm-advisories.json 2>/dev/null; then
+              echo "✅ Fetched npm audit data"
+              if command -v jq >/dev/null 2>&1; then
+                before_count=$(wc -l < security-reports/comprehensive-threats.txt)
+                # Parse npm audit format
+                jq -r '.[] | .module_name + "@" + (.vulnerable_versions // "*")' temp-data/npm-advisories.json >> security-reports/comprehensive-threats.txt 2>/dev/null || echo "⚠️ Could not parse npm audit data"
+                after_count=$(wc -l < security-reports/comprehensive-threats.txt)
+                npm_added=$((after_count - before_count))
+                echo "📊 Added $npm_added threats from npm audit API"
+              fi
+            else
+              echo "⚠️ Could not fetch from any external threat intelligence sources"
+            fi
+          fi
+          
+          # Ensure we have a valid threats file
+          if [[ ! -f security-reports/comprehensive-threats.txt ]] || [[ ! -s security-reports/comprehensive-threats.txt ]]; then
+            echo "⚠️ No threat data found, creating minimal threat list..."
+            echo "@ctrl/tinycolor@99.99.99" > security-reports/comprehensive-threats.txt
+          fi
+          
+          # Deduplicate and sort
+          sort -u security-reports/comprehensive-threats.txt > security-reports/final-threats.txt
+          
+          echo "📊 Threat Intelligence Summary:"
+          echo "Total threats: $(wc -l < security-reports/final-threats.txt)"
+          echo "First 5 threats:"
+          head -5 security-reports/final-threats.txt || echo "No threats to display"
+        displayName: "Aggregate threat intelligence"
+      
+      # Publish threat intelligence data as pipeline artifact for subsequent stages
+      - task: PublishPipelineArtifact@1
+        displayName: "📤 Publish Threat Intelligence Data"
+        inputs:
+          targetPath: 'security-reports'
+          artifact: 'threat-intelligence-data'
+          publishLocation: 'pipeline'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🧪 STAGE 2: CONTROLLED TESTING ENVIRONMENT
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: TestEnvironment
+  displayName: "🧪 Create Controlled Test Environment"
+  dependsOn: ThreatIntelligence
+  jobs:
+  - job: CreateTestPackage
+    displayName: "Create controlled test package"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 5
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "🧪 Creating controlled test environment..."
+          mkdir -p node_modules/@ctrl/tinycolor temp-data/test-packages security-reports
+          
+          # Create test package with known signature
+          cat > node_modules/@ctrl/tinycolor/package.json << 'EOF'
+          {
+            "name": "@ctrl/tinycolor",
+            "version": "99.99.99",
+            "description": "TEST PACKAGE - Security Scanner Validation",
+            "scripts": {
+              "postinstall": "echo 'Shai-Hulud-Test-Marker-$(scanTimestamp)'"
+            },
+            "_scannerTestMarker": true
+          }
+          EOF
+          
+          # Create test malicious file
+          echo "// Shai-Hulud Test Marker" > temp-data/test-malicious.js
+          echo "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09" > temp-data/expected-hash.txt
+          
+          # Ensure compromised packages file exists for later stages
+          if [[ ! -f "$(compromisedPackagesFile)" ]]; then
+            echo "⚠️ Creating default compromised packages file for testing..."
+            echo "@ctrl/tinycolor@99.99.99" > "$(compromisedPackagesFile)"
+          fi
+          
+          echo "✅ Test environment created successfully"
+        displayName: "Create test artifacts"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔍 STAGE 3: PARALLEL SECURITY SCANNING
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: SecurityScanning
+  displayName: "🔍 Comprehensive Security Scanning"
+  dependsOn: TestEnvironment
+  condition: succeeded()
+  jobs:
+  # ─── FILESYSTEM SCAN ─────────────────────────────────────────────────
+  - job: FilesystemScan
+    displayName: "🗂️ Filesystem Security Scan"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: ${{ parameters.timeoutMinutes }}
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      # Download threat intelligence data from previous stage
+      - task: DownloadPipelineArtifact@2
+        displayName: "📥 Download Threat Intelligence Data"
+        inputs:
+          buildType: 'current'
+          artifactName: 'threat-intelligence-data'
+          targetPath: '$(Pipeline.Workspace)/threat-data'
+        continueOnError: true
+      
+      - script: |
+          echo "🔍 Starting intelligent filesystem scan..."
+          mkdir -p security-reports/filesystem
+          
+          # Try to use threat intelligence data from previous stage
+          if [[ -f "$(Pipeline.Workspace)/threat-data/final-threats.txt" ]]; then
+            echo "✅ Using threat intelligence from previous stage"
+            cp "$(Pipeline.Workspace)/threat-data/final-threats.txt" security-reports/final-threats.txt
+          elif [[ -f "security-reports/final-threats.txt" ]]; then
+            echo "✅ Using existing threat intelligence data"
+          else
+            echo "⚠️ Threat intelligence not available, using compromised packages file..."
+            if [[ -f "$(compromisedPackagesFile)" ]]; then
+              cp "$(compromisedPackagesFile)" security-reports/final-threats.txt
+            else
+              echo "@ctrl/tinycolor@99.99.99" > security-reports/final-threats.txt
+            fi
+          fi
+          
+          # Smart filesystem scanning (avoid dangerous paths)
+          EXCLUDE_PATHS="-path /proc -o -path /sys -o -path /dev -o -path /tmp"
+          COMMON_NODE_PATHS="/usr/local/lib/node_modules /opt/node_modules ./node_modules ~/.npm"
+          
+          # Initialize found packages file
+          touch security-reports/filesystem/found-packages.txt
+          
+          # Scan common Node.js locations only
+          for path in $COMMON_NODE_PATHS; do
+            if [[ -d "$path" ]]; then
+              echo "Scanning: $path"
+              find "$path" -type d -maxdepth ${{ parameters.scanDepth }} -name "*" 2>/dev/null | while read -r dir; do
+                basename "$dir"
+              done >> security-reports/filesystem/found-packages.txt
+            fi
+          done
+          
+          # Check against threat list
+          threats_detected=0
+          while read -r threat; do
+            if [[ -n "$threat" ]]; then
+              pkg_name=$(echo "$threat" | cut -d'@' -f1)
+              if grep -F "$pkg_name" security-reports/filesystem/found-packages.txt >/dev/null 2>&1; then
+                echo "❌ THREAT DETECTED: $pkg_name found in filesystem"
+                echo "$threat" >> security-reports/filesystem/detected-threats.txt
+                threats_detected=1
+              fi
+            fi
+          done < security-reports/final-threats.txt
+          
+          # Summary
+          if [[ $threats_detected -eq 1 ]]; then
+            echo "❌ Filesystem scan detected $(wc -l < security-reports/filesystem/detected-threats.txt 2>/dev/null || echo "unknown") threats"
+            exit 1
+          else
+            echo "✅ Filesystem scan completed - no threats detected"
+          fi
+        displayName: "Intelligent filesystem threat scan"
+
+  # ─── DEPENDENCY SCAN ─────────────────────────────────────────────────
+  - job: DependencyScan
+    displayName: "📦 Dependency Security Scan"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: ${{ parameters.timeoutMinutes }}
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      # Download threat intelligence data from previous stage
+      - task: DownloadPipelineArtifact@2
+        displayName: "📥 Download Threat Intelligence Data"
+        inputs:
+          buildType: 'current'
+          artifactName: 'threat-intelligence-data'
+          targetPath: '$(Pipeline.Workspace)/threat-data'
+        continueOnError: true
+      
+      - script: |
+          echo "📦 Starting comprehensive dependency scan..."
+          mkdir -p security-reports/dependencies
+          
+          # Try to use threat intelligence data from previous stage
+          if [[ -f "$(Pipeline.Workspace)/threat-data/final-threats.txt" ]]; then
+            echo "✅ Using threat intelligence from previous stage"
+            cp "$(Pipeline.Workspace)/threat-data/final-threats.txt" security-reports/final-threats.txt
+          elif [[ -f "security-reports/final-threats.txt" ]]; then
+            echo "✅ Using existing threat intelligence data"
+          else
+            echo "⚠️ Threat intelligence not available, using compromised packages file..."
+            if [[ -f "$(compromisedPackagesFile)" ]]; then
+              cp "$(compromisedPackagesFile)" security-reports/final-threats.txt
+            else
+              echo "@ctrl/tinycolor@99.99.99" > security-reports/final-threats.txt
+            fi
+          fi
+          
+          # Find all package files
+          find . -name "package*.json" -o -name "yarn.lock" -o -name "pnpm-lock.yaml" > security-reports/dependencies/package-files.txt 2>/dev/null
+          
+          echo "📄 Found package files:"
+          if [[ -s security-reports/dependencies/package-files.txt ]]; then
+            cat security-reports/dependencies/package-files.txt
+          else
+            echo "No package files found"
+          fi
+          
+          # Scan each package file
+          threats_found=0
+          while read -r file; do
+            if [[ -f "$file" && -n "$file" ]]; then
+              echo "Scanning: $file"
+              while read -r threat; do
+                if [[ -n "$threat" ]]; then
+                  if grep -F "$threat" "$file" >/dev/null 2>&1; then
+                    echo "❌ THREAT DETECTED in $file: $threat"
+                    echo "$file: $threat" >> security-reports/dependencies/detected-threats.txt
+                    threats_found=1
+                  fi
+                fi
+              done < security-reports/final-threats.txt
+            fi
+          done < security-reports/dependencies/package-files.txt
+          
+          if [[ $threats_found -eq 1 ]]; then
+            echo "❌ Dependency scan detected threats"
+            exit 1
+          else
+            echo "✅ Dependency scan completed - no threats detected"
+          fi
+        displayName: "Scan package dependencies"
+
+  # ─── MALWARE SCAN ────────────────────────────────────────────────────
+  - job: MalwareScan
+    displayName: "🦠 Malware & Artifact Scan"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: ${{ parameters.timeoutMinutes }}
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "🦠 Starting malware and suspicious artifact scan..."
+          mkdir -p security-reports/malware
+          
+          # Known malicious file patterns
+          MALICIOUS_PATTERNS="shai-hulud-workflow.yml malicious-bundle.js crypto-miner.js"
+          SUSPICIOUS_PATTERNS="*.exe *.scr *.bat *.cmd *.ps1"
+          
+          # Scan for known malicious files
+          threats_found=0
+          for pattern in $MALICIOUS_PATTERNS; do
+            echo "Checking for pattern: $pattern"
+            found_files=$(find . -name "$pattern" -type f 2>/dev/null)
+            if [[ -n "$found_files" ]]; then
+              echo "❌ Found suspicious file matching: $pattern"
+              echo "$found_files"
+              echo "$found_files" >> security-reports/malware/suspicious-files.txt
+              threats_found=1
+            fi
+          done
+          
+          # Hash-based detection
+          KNOWN_MALICIOUS_HASHES="46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09"
+          
+          find . -type f \( -name "*.js" -o -name "*.json" -o -name "bundle*" \) -exec sha256sum {} + 2>/dev/null | while read -r hash file; do
+            if echo "$KNOWN_MALICIOUS_HASHES" | grep -F "$hash" >/dev/null; then
+              echo "❌ MALICIOUS HASH DETECTED: $file ($hash)"
+              echo "$file: $hash" >> security-reports/malware/malicious-hashes.txt
+              threats_found=1
+            fi
+          done
+          
+          # Check results
+          if [[ $threats_found -eq 1 ]] || [[ -f security-reports/malware/suspicious-files.txt ]] || [[ -f security-reports/malware/malicious-hashes.txt ]]; then
+            echo "❌ Malware scan detected threats"
+            exit 1
+          else
+            echo "✅ Malware scan completed - no threats detected"
+          fi
+        displayName: "Scan for malware and suspicious artifacts"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📋 STAGE 4: SBOM GENERATION & COMPLIANCE
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: SBOMGeneration
+  displayName: "📋 SBOM Generation & Compliance Check"
+  dependsOn: SecurityScanning
+  condition: and(succeeded(), eq('${{ parameters.generateSBOM }}', true))
+  jobs:
+  - job: GenerateSBOM
+    displayName: "Generate Software Bill of Materials"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 10
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "📋 Generating Software Bill of Materials (SBOM)..."
+          mkdir -p security-reports/sbom
+          
+          # Create SBOM in SPDX format
+          cat > security-reports/sbom/$(sbomFile) << 'EOF'
+          {
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "$(Build.Repository.Name)-SBOM",
+            "documentNamespace": "https://dev.azure.com/$(System.TeamProject)/$(Build.Repository.Name)/$(Build.BuildId)",
+            "creationInfo": {
+              "created": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+              "creators": ["Tool: Shai-Hulud-Scanner-v$(pipelineVersion)"]
+            },
+            "packages": []
+          }
+          EOF
+          
+          # Extract dependencies from package.json files
+          if [[ -f package.json ]]; then
+            echo "📦 Extracting dependencies from package.json..."
+            if command -v jq >/dev/null 2>&1; then
+              jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' package.json > security-reports/sbom/dependencies.txt 2>/dev/null || echo "Could not parse dependencies"
+              jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' package.json > security-reports/sbom/dev-dependencies.txt 2>/dev/null || echo "Could not parse devDependencies"
+            else
+              echo "⚠️ jq not available, extracting dependencies manually..."
+              grep -A 100 '"dependencies"' package.json | grep -E '"\w+":' | head -50 > security-reports/sbom/dependencies.txt || touch security-reports/sbom/dependencies.txt
+            fi
+          else
+            echo "⚠️ No package.json found"
+            touch security-reports/sbom/dependencies.txt
+            touch security-reports/sbom/dev-dependencies.txt
+          fi
+          
+          echo "✅ SBOM generation completed"
+        displayName: "Generate SBOM"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📊 STAGE 5: REPORTING & ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: Reporting
+  displayName: "📊 Security Report Generation"
+  dependsOn: 
+    - SecurityScanning
+    - SBOMGeneration
+  condition: always()
+  jobs:
+  - job: GenerateReports
+    displayName: "Generate comprehensive security report"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 5
+    steps:
+      - checkout: self
+        fetchDepth: 1
+      
+      - script: |
+          echo "📊 Generating comprehensive security report..."
+          mkdir -p security-reports/final
+          
+          # Create summary report
+          cat > security-reports/final/security-summary.md << EOF
+          # 🛡️ Shai-Hulud Security Scan Report
+          
+          **Repository:** $(Build.Repository.Name)  
+          **Build ID:** $(Build.BuildId)  
+          **Scan Date:** $(scanTimestamp)  
+          **Scanner Version:** $(pipelineVersion)  
+          
+          ## 📋 Scan Summary
+          
+          | Component | Status | Details |
+          |-----------|--------|---------|
+          | Filesystem Scan | $(if [[ -f security-reports/filesystem/detected-threats.txt ]]; then echo "❌ THREATS FOUND"; else echo "✅ CLEAN"; fi) | $(if [[ -f security-reports/filesystem/detected-threats.txt ]]; then wc -l < security-reports/filesystem/detected-threats.txt; else echo "0"; fi) threats detected |
+          | Dependency Scan | $(if [[ -f security-reports/dependencies/detected-threats.txt ]]; then echo "❌ THREATS FOUND"; else echo "✅ CLEAN"; fi) | $(if [[ -f security-reports/dependencies/detected-threats.txt ]]; then wc -l < security-reports/dependencies/detected-threats.txt; else echo "0"; fi) threats detected |
+          | Malware Scan | $(if [[ -f security-reports/malware/suspicious-files.txt ]] || [[ -f security-reports/malware/malicious-hashes.txt ]]; then echo "❌ THREATS FOUND"; else echo "✅ CLEAN"; fi) | Suspicious artifacts check |
+          
+          ## 🔍 Detailed Findings
+          
+          EOF
+          
+          # Add detailed findings if any
+          if [[ -f security-reports/filesystem/detected-threats.txt ]]; then
+            echo "### ❌ Filesystem Threats" >> security-reports/final/security-summary.md
+            cat security-reports/filesystem/detected-threats.txt >> security-reports/final/security-summary.md
+            echo "" >> security-reports/final/security-summary.md
+          fi
+          
+          if [[ -f security-reports/dependencies/detected-threats.txt ]]; then
+            echo "### ❌ Dependency Threats" >> security-reports/final/security-summary.md
+            cat security-reports/dependencies/detected-threats.txt >> security-reports/final/security-summary.md
+            echo "" >> security-reports/final/security-summary.md
+          fi
+          
+          echo "✅ Security report generated: security-reports/final/security-summary.md"
+        displayName: "Generate security summary report"
+
+      - task: PublishBuildArtifacts@1
+        displayName: "📤 Publish Security Reports"
+        inputs:
+          pathtoPublish: 'security-reports'
+          artifactName: '$(artifactName)'
+          publishLocation: 'Container'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🚨 STAGE 6: ALERTING & NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: Alerting
+  displayName: "🚨 Security Alerting & Notifications"
+  dependsOn: Reporting
+  condition: failed()
+  jobs:
+  - job: SendAlerts
+    displayName: "Send security alerts"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 5
+    steps:
+      - script: |
+          echo "🚨 SECURITY ALERT: Threats detected in $(Build.Repository.Name)"
+          echo "🔗 Build URL: $(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+          echo "📊 Detailed reports available in build artifacts"
+          
+          # Here you would integrate with your notification system
+          # Examples: Slack, Teams, Email, ServiceNow, etc.
+          
+          echo "⚠️ Manual review required for detected security threats"
+        displayName: "Generate security alerts"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🧹 STAGE 7: CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+- stage: Cleanup
+  displayName: "🧹 Pipeline Cleanup"
+  dependsOn: 
+    - Reporting
+    - Alerting
+  condition: always()
+  jobs:
+  - job: CleanupResources
+    displayName: "Clean up temporary resources"
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 5
+    steps:
+      - script: |
+          echo "🧹 Cleaning up temporary resources..."
+          
+          # Remove test packages
+          rm -rf node_modules/@ctrl/tinycolor
+          rm -rf temp-data
+          
+          # Clean up sensitive data but keep reports
+          find . -name "*.tmp" -delete 2>/dev/null || true
+          
+          echo "✅ Cleanup completed"
+        displayName: "Clean up temporary files"
